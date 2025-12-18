@@ -1,0 +1,355 @@
+name: Terraform Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Ação a ser executada'
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+
+jobs:
+  terraform:
+    name: Terraform ${{ github.event.inputs.action }}
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS CLI
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Validar secrets obrigatórios
+        run: |
+          if [ -z "${{ secrets.S3_BUCKET_NAME }}" ]; then
+            echo "❌ Erro: S3_BUCKET_NAME não está configurado nos secrets do GitHub!"
+            echo "💡 Configure o secret S3_BUCKET_NAME em Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          echo "✅ Secrets validados"
+
+      - name: Criar arquivo terraform.tfvars
+        working-directory: ./terraform
+        run: |
+          cat > terraform.tfvars <<EOF
+          aws_region  = "${{ secrets.AWS_REGION || 'us-east-1' }}"
+          bucket_name = "${{ secrets.S3_BUCKET_NAME }}"
+          environment = "${{ secrets.TERRAFORM_ENVIRONMENT || 'prod' }}"
+          EOF
+          echo "✅ Arquivo terraform.tfvars criado"
+          echo "📦 Bucket: ${{ secrets.S3_BUCKET_NAME }}"
+          echo "🌍 Região: ${{ secrets.AWS_REGION || 'us-east-1' }}"
+          echo "🔧 Ambiente: ${{ secrets.TERRAFORM_ENVIRONMENT || 'prod' }}"
+
+      - name: Preparar bucket de state do Terraform
+        run: |
+          STATE_BUCKET="${{ secrets.S3_BUCKET_NAME }}-terraform-state"
+          REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+          
+          echo "🔍 Verificando bucket de state: $STATE_BUCKET"
+          
+          if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
+            echo "✅ Bucket de state já existe: $STATE_BUCKET"
+          else
+            echo "📦 Criando bucket de state: $STATE_BUCKET na região $REGION"
+            
+            if [ "$REGION" = "us-east-1" ]; then
+              aws s3api create-bucket \
+                --bucket "$STATE_BUCKET" \
+                --region "$REGION" || {
+                  echo "⚠️ Erro ao criar bucket. Pode já existir em outra região ou ter problema de permissões."
+                  exit 1
+                }
+            else
+              aws s3api create-bucket \
+                --bucket "$STATE_BUCKET" \
+                --region "$REGION" \
+                --create-bucket-configuration LocationConstraint="$REGION" || {
+                  echo "⚠️ Erro ao criar bucket. Pode já existir em outra região ou ter problema de permissões."
+                  exit 1
+                }
+            fi
+            
+            sleep 3
+            
+            aws s3api put-bucket-versioning \
+              --bucket "$STATE_BUCKET" \
+              --versioning-configuration Status=Enabled
+            
+            aws s3api put-public-access-block \
+              --bucket "$STATE_BUCKET" \
+              --public-access-block-configuration \
+              "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+            
+            aws s3api put-bucket-encryption \
+              --bucket "$STATE_BUCKET" \
+              --server-side-encryption-configuration '{
+                "Rules": [{
+                  "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "AES256"
+                  }
+                }]
+              }' 2>/dev/null || echo "⚠️ Não foi possível configurar criptografia (pode não ter permissão)"
+            
+            echo "✅ Bucket de state criado e configurado: $STATE_BUCKET"
+          fi
+          
+          echo "STATE_BUCKET=$STATE_BUCKET" >> $GITHUB_ENV
+          echo "AWS_REGION=$REGION" >> $GITHUB_ENV
+          echo "📋 Bucket de state: $STATE_BUCKET"
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Validate
+        working-directory: ./terraform
+        run: terraform validate
+
+      - name: Importar recursos existentes (para apply)
+        if: github.event.inputs.action == 'apply'
+        working-directory: ./terraform
+        continue-on-error: true
+        run: |
+          BUCKET_NAME="${{ secrets.S3_BUCKET_NAME }}"
+          REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+          
+          echo "🔍 Verificando se há recursos existentes na AWS que precisam ser importados..."
+          
+          if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "✅ Bucket '$BUCKET_NAME' existe na AWS"
+            
+            if terraform state show aws_s3_bucket.website 2>/dev/null | grep -q "bucket.*=.*\"$BUCKET_NAME\""; then
+              echo "✅ Bucket já está no state do Terraform"
+            else
+              echo "📥 Importando bucket para o state do Terraform..."
+              terraform import aws_s3_bucket.website "$BUCKET_NAME" || {
+                echo "⚠️ Não foi possível importar o bucket automaticamente."
+                echo "💡 Isso pode acontecer se o bucket foi criado fora do Terraform."
+                echo "   O Terraform tentará atualizar o state durante o plan/apply."
+                exit 0
+              }
+              
+              echo "📥 Tentando importar recursos relacionados do bucket..."
+              
+              terraform import aws_s3_bucket_public_access_block.website "$BUCKET_NAME" 2>/dev/null && echo "  ✅ Public access block importado" || echo "  ⚠️ Public access block não encontrado"
+              
+              terraform import aws_s3_bucket_versioning.website "$BUCKET_NAME" 2>/dev/null && echo "  ✅ Versioning importado" || echo "  ⚠️ Versioning não encontrado"
+              
+              echo "🔍 Buscando OAI existente..."
+              OAI_LIST=$(aws cloudfront list-cloud-front-origin-access-identities --query "CloudFrontOriginAccessIdentityList.Items[*].[Id,Comment]" --output text 2>/dev/null || echo "")
+              if [ -n "$OAI_LIST" ]; then
+                OAI_ID=$(echo "$OAI_LIST" | grep "OAI for $BUCKET_NAME" | head -n 1 | awk '{print $1}' || echo "")
+                if [ -n "$OAI_ID" ] && [ "$OAI_ID" != "None" ]; then
+                  echo "📥 Importando OAI existente: $OAI_ID"
+                  terraform import aws_cloudfront_origin_access_identity.website "$OAI_ID" 2>/dev/null && echo "  ✅ OAI importado" || echo "  ⚠️ OAI não pôde ser importado"
+                fi
+              fi
+              
+              echo "🔍 Buscando CloudFront Distribution existente..."
+              BUCKET_DOMAIN="$BUCKET_NAME.s3.$REGION.amazonaws.com"
+              DIST_LIST=$(aws cloudfront list-distributions --query "DistributionList.Items[*].[Id,Origins.Items[0].DomainName]" --output text 2>/dev/null || echo "")
+              if [ -n "$DIST_LIST" ]; then
+                DIST_ID=$(echo "$DIST_LIST" | grep "$BUCKET_DOMAIN\|$BUCKET_NAME" | head -n 1 | awk '{print $1}' || echo "")
+                if [ -n "$DIST_ID" ] && [ "$DIST_ID" != "None" ]; then
+                  echo "📥 Importando CloudFront Distribution existente: $DIST_ID"
+                  terraform import aws_cloudfront_distribution.website "$DIST_ID" 2>/dev/null && echo "  ✅ CloudFront Distribution importado" || echo "  ⚠️ CloudFront Distribution não pôde ser importado"
+                fi
+              fi
+              
+              echo "✅ Processo de importação concluído"
+            fi
+          else
+            echo "ℹ️ Bucket não existe ainda. Será criado pelo Terraform."
+          fi
+
+      - name: Verificar state e recursos existentes (para destroy)
+        if: github.event.inputs.action == 'destroy'
+        working-directory: ./terraform
+        run: |
+          echo "🔍 Verificando state no S3..."
+          
+          STATE_COUNT=$(terraform state list 2>/dev/null | wc -l || echo "0")
+          
+          if [ "$STATE_COUNT" -gt 0 ]; then
+            echo "✅ State encontrado com $STATE_COUNT recursos:"
+            terraform state list
+            echo "STATE_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "⚠️ Nenhum state encontrado no S3!"
+            echo ""
+            echo "🔍 Verificando se os recursos existem na AWS..."
+            
+            BUCKET_NAME="${{ secrets.S3_BUCKET_NAME }}"
+            if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+              echo "⚠️ O bucket '$BUCKET_NAME' existe na AWS, mas não está no state!"
+              echo ""
+              echo "📝 SITUAÇÃO:"
+              echo "   Os recursos foram criados antes de configurar o backend S3."
+              echo "   O state local foi perdido e não foi migrado para o S3."
+              echo ""
+              echo "💡 SOLUÇÕES:"
+              echo "   1. Execute 'Terraform Apply' - ele detectará que os recursos já existem"
+              echo "      e atualizará o state sem recriar nada (refresh)."
+              echo "   2. Depois execute 'Terraform Destroy' para destruir os recursos."
+              echo ""
+              echo "   OU"
+              echo ""
+              echo "   1. Delete os recursos manualmente na AWS Console"
+              echo "   2. Execute 'Terraform Apply' para criar tudo novamente com state no S3"
+              echo ""
+              echo "STATE_EXISTS=false" >> $GITHUB_ENV
+            else
+              echo "✅ Nenhum recurso encontrado na AWS."
+              echo "   Não há nada para destruir."
+              echo "STATE_EXISTS=false" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Verificar se import foi necessário
+        if: github.event.inputs.action == 'apply'
+        working-directory: ./terraform
+        run: |
+          BUCKET_NAME="${{ secrets.S3_BUCKET_NAME }}"
+          echo "🔍 Verificando se o bucket está no state após importação..."
+          
+          if terraform state show aws_s3_bucket.website 2>/dev/null | grep -q "bucket.*=.*\"$BUCKET_NAME\""; then
+            echo "✅ Bucket está no state. Pronto para plan/apply."
+            echo "IMPORT_SUCCESS=true" >> $GITHUB_ENV
+          else
+            if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+              echo "⚠️ Bucket existe na AWS mas não está no state!"
+              echo "💡 Tentando importar novamente..."
+              terraform import aws_s3_bucket.website "$BUCKET_NAME" && echo "IMPORT_SUCCESS=true" >> $GITHUB_ENV || echo "IMPORT_SUCCESS=false" >> $GITHUB_ENV
+            else
+              echo "ℹ️ Bucket não existe. Será criado."
+              echo "IMPORT_SUCCESS=true" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Terraform Plan
+        if: github.event.inputs.action == 'apply' && env.IMPORT_SUCCESS == 'true'
+        working-directory: ./terraform
+        run: terraform plan -out=tfplan
+
+      - name: Aviso - Import necessário
+        if: github.event.inputs.action == 'apply' && env.IMPORT_SUCCESS == 'false'
+        run: |
+          echo "❌ Não foi possível importar o bucket automaticamente."
+          echo ""
+          echo "💡 SOLUÇÃO MANUAL:"
+          echo "   1. Execute este comando localmente ou em um runner:"
+          echo "      cd terraform"
+          echo "      terraform init -backend-config=\"bucket=${{ secrets.S3_BUCKET_NAME }}-terraform-state\" -backend-config=\"key=terraform.tfstate\" -backend-config=\"region=${{ secrets.AWS_REGION || 'us-east-1' }}\" -backend-config=\"encrypt=true\""
+          echo "      terraform import aws_s3_bucket.website ${{ secrets.S3_BUCKET_NAME }}"
+          echo "   2. Depois execute o workflow novamente"
+          echo ""
+          exit 1
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply' && env.IMPORT_SUCCESS == 'true'
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Verificar state após apply
+        if: github.event.inputs.action == 'apply'
+        working-directory: ./terraform
+        run: |
+          echo "✅ Apply concluído!"
+          echo ""
+          echo "📋 Recursos gerenciados pelo Terraform:"
+          terraform state list
+          echo ""
+          echo "💾 State salvo no S3: s3://${{ env.STATE_BUCKET }}/terraform.tfstate"
+          echo "   Agora você pode executar 'Terraform Destroy' e ele funcionará corretamente!"
+
+      - name: Limpar bucket S3 antes do destroy
+        if: github.event.inputs.action == 'destroy' && env.STATE_EXISTS == 'true'
+        continue-on-error: true
+        run: |
+          BUCKET_NAME="${{ secrets.S3_BUCKET_NAME }}"
+          
+          echo "🧹 Limpando bucket S3 antes do destroy..."
+          
+          if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "📦 Limpando bucket: $BUCKET_NAME"
+            
+            cat > /tmp/empty_bucket.py << 'EOF'
+          import boto3
+          import sys
+          
+          bucket_name = sys.argv[1]
+          s3 = boto3.client('s3')
+          
+          try:
+              paginator = s3.get_paginator('list_object_versions')
+              total = 0
+              
+              for page in paginator.paginate(Bucket=bucket_name):
+                  delete_list = []
+                  
+                  if 'Versions' in page:
+                      delete_list.extend([{'Key': v['Key'], 'VersionId': v['VersionId']} for v in page['Versions']])
+                  if 'DeleteMarkers' in page:
+                      delete_list.extend([{'Key': m['Key'], 'VersionId': m['VersionId']} for m in page['DeleteMarkers']])
+                  
+                  if delete_list:
+                      for i in range(0, len(delete_list), 1000):
+                          s3.delete_objects(Bucket=bucket_name, Delete={'Objects': delete_list[i:i+1000], 'Quiet': True})
+                      total += len(delete_list)
+              
+              if total > 0:
+                  print(f"✅ Deletadas {total} versões/markers")
+              else:
+                  print("ℹ️ Nenhuma versão encontrada")
+          except Exception as e:
+              print(f"⚠️ {e}")
+          EOF
+            
+            python3 /tmp/empty_bucket.py "$BUCKET_NAME" || {
+              echo "⚠️ Python não disponível ou falhou, usando AWS CLI..."
+              aws s3 rm s3://"$BUCKET_NAME"/ --recursive --quiet 2>/dev/null || true
+            }
+            
+            echo "✅ Limpeza concluída. O Terraform deletará o bucket (force_destroy=true)"
+          else
+            echo "ℹ️ Bucket não existe"
+          fi
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy' && env.STATE_EXISTS == 'true'
+        working-directory: ./terraform
+        run: terraform destroy -auto-approve
+
+      - name: Aviso - Destroy não executado
+        if: github.event.inputs.action == 'destroy' && env.STATE_EXISTS == 'false'
+        run: |
+          echo "❌ Destroy não foi executado porque não há state no S3."
+          echo "💡 Execute primeiro 'Terraform Apply' para criar os recursos e salvar o state."
+          exit 1
+
+      - name: Output CloudFront URL
+        if: github.event.inputs.action == 'apply'
+        working-directory: ./terraform
+        run: |
+          echo "CloudFront URL: $(terraform output -raw cloudfront_url)"
+          echo "CLOUDFRONT_URL=$(terraform output -raw cloudfront_url)" >> $GITHUB_ENV
